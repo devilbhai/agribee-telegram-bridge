@@ -1,32 +1,35 @@
 import os
+import asyncio
 import requests
 from flask import Flask, request, jsonify
-from telegram import Bot
+from telegram import Bot, Update
+from telegram.ext import Application, ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
 
+# Flask app
 app = Flask(__name__)
 
-# ENV Variables
+# ENV variables (set in Render Dashboard)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 WHATSAPP_API_TOKEN = os.environ.get("WHATSAPP_API_TOKEN")
 
 bot = Bot(TELEGRAM_BOT_TOKEN)
 
-# WhatsApp APIs
-WHATSAPP_SEND_TEXT_URL  = "https://app.agribee.in/api/v1/agribee/messages/send"
+WHATSAPP_SEND_TEXT_URL = "https://app.agribee.in/api/v1/agribee/messages/send"
 WHATSAPP_SEND_MEDIA_URL = "https://app.agribee.in/api/v1/agribee/messages/media"
 
-# -----------------------------
+
+# ---------------------------------------------------------------------
 # HOME
-# -----------------------------
+# ---------------------------------------------------------------------
 @app.route("/")
 def home():
-    return "Bot Running", 200
+    return "OK - Telegram/WhatsApp Bridge Running", 200
 
 
-# -----------------------------
-# WHATSAPP → TELEGRAM
-# -----------------------------
+# ---------------------------------------------------------------------
+# WHATSAPP WEBHOOK → TELEGRAM
+# ---------------------------------------------------------------------
 @app.route("/webhook", methods=["POST"])
 def whatsapp_webhook():
     try:
@@ -34,93 +37,120 @@ def whatsapp_webhook():
         entry = data.get("entry", [])[0]
         value = entry.get("changes", [])[0].get("value", {})
 
-        msgs     = value.get("messages", [])
+        msgs = value.get("messages", [])
         contacts = value.get("contacts", [])
 
         if not msgs:
-            return jsonify({"status": "ok"})
+            return jsonify({"ok": True})
 
-        msg     = msgs[0]
+        msg = msgs[0]
         contact = contacts[0] if contacts else {}
 
         wa_number = contact.get("wa_id") or msg.get("from")
         name = contact.get("profile", {}).get("name", wa_number)
 
-        # TEXT MESSAGE
+        # Text message
         if msg.get("type") == "text":
             text = msg["text"]["body"]
 
             message = f"📩 *WhatsApp message*\nFrom: {name} ({wa_number})\n\n{text}"
 
-            bot.send_message(
+            asyncio.run(bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
                 text=message,
                 parse_mode="Markdown"
-            )
+            ))
 
     except Exception as e:
-        print("WhatsApp Webhook Error:", e)
+        print("Webhook Error:", e)
 
-    return jsonify({"status": "ok"})
+    return jsonify({"ok": True})
 
 
-# -----------------------------
-# TELEGRAM → WHATSAPP (Webhook)
-# -----------------------------
+# ---------------------------------------------------------------------
+# TELEGRAM WEBHOOK HANDLER → REPLY TO WHATSAPP
+# ---------------------------------------------------------------------
+async def telegram_webhook_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+
+    if update.message.reply_to_message is None:
+        await update.message.reply_text("Reply to a WhatsApp message to send back.")
+        return
+
+    original_text = update.message.reply_to_message.text
+
+    import re
+    match = re.search(r"\((\d{10,15})\)", original_text)
+    if not match:
+        await update.message.reply_text("Could not detect WhatsApp number.")
+        return
+
+    wa_number = match.group(1)
+
+    # Sending text to WhatsApp
+    payload = {
+        "to": wa_number,
+        "message": update.message.text
+    }
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    r = requests.post(WHATSAPP_SEND_TEXT_URL, json=payload, headers=headers)
+    if r.ok:
+        await update.message.reply_text("✔ WhatsApp reply sent")
+    else:
+        await update.message.reply_text("❌ Failed to send WhatsApp message")
+
+
+# ---------------------------------------------------------------------
+# FLASK ROUTE → TELEGRAM WEBHOOK ENTRY
+# ---------------------------------------------------------------------
 @app.route(f"/telegram-webhook/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
 def telegram_webhook():
-    data = request.json
-
     try:
-        message = data.get("message", {})
-        text    = message.get("text", "")
-        reply   = message.get("reply_to_message", {})
-        chat_id = message.get("chat", {}).get("id")
-
-        # Only accept replies to forwarded WhatsApp messages
-        if reply:
-            original = reply.get("text", "")
-            import re
-            match = re.search(r"\((\d{10,15})\)", original)
-            if not match:
-                return jsonify({"ok": True})
-
-            wa_number = match.group(1)
-
-            payload = {
-                "to": wa_number,
-                "message": text
-            }
-
-            headers = {
-                "Authorization": f"Bearer {WHATSAPP_API_TOKEN}",
-                "Content-Type": "application/json"
-            }
-
-            requests.post(WHATSAPP_SEND_TEXT_URL, json=payload, headers=headers)
-
-            bot.send_message(chat_id, "✅ Sent to WhatsApp")
-
+        data = request.json
+        update = Update.de_json(data, bot)
+        application = app.config["tg_app"]
+        asyncio.run(application.process_update(update))
     except Exception as e:
         print("Telegram Webhook Error:", e)
 
     return jsonify({"ok": True})
 
 
-# -----------------------------
-# Set Telegram Webhook on Startup
-# -----------------------------
-def set_telegram_webhook():
-    url = f"https://agribee-telegram-bridge.onrender.com/telegram-webhook/{TELEGRAM_BOT_TOKEN}"
-    bot.delete_webhook()
-    bot.set_webhook(url=url)
-    print("Telegram Webhook Set:", url)
+# ---------------------------------------------------------------------
+# SET TELEGRAM WEBHOOK
+# ---------------------------------------------------------------------
+async def setup_webhook():
+    url = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/telegram-webhook/{TELEGRAM_BOT_TOKEN}"
+
+    await bot.delete_webhook()
+    await bot.set_webhook(url=url)
+
+    print("Telegram Webhook Set To:", url)
 
 
-# -----------------------------
-# RUN FLASK
-# -----------------------------
+# ---------------------------------------------------------------------
+# START BOT WITH WEBHOOK MODE
+# ---------------------------------------------------------------------
+def start_telegram():
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, telegram_webhook_handler))
+
+    app.config["tg_app"] = application
+
+    asyncio.run(setup_webhook())
+
+
+# ---------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------
 if __name__ == "__main__":
-    set_telegram_webhook()
+    start_telegram()
+
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
