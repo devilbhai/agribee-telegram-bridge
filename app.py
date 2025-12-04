@@ -28,44 +28,98 @@ def home():
 
 
 # ---------------------------------------------------------------------
-# WHATSAPP WEBHOOK → TELEGRAM
+# WHATSAPP / GENERIC WEBHOOK → TELEGRAM (improved logging + debug)
 # ---------------------------------------------------------------------
 @app.route("/webhook", methods=["POST"])
 def whatsapp_webhook():
     try:
+        raw = request.get_data(as_text=True)
+        # log raw payload for debugging
+        try:
+            with open("webhook_received.log", "a", encoding="utf-8") as f:
+                f.write("=== " + asyncio.get_event_loop().time().__str__() + " ===\n")
+                f.write(raw + "\n\n")
+        except Exception as log_exc:
+            print("Log write error:", log_exc)
+
         data = request.json or {}
-        entry = data.get("entry", [])[0]
-        value = entry.get("changes", [])[0].get("value", {})
 
-        msgs = value.get("messages", [])
-        contacts = value.get("contacts", [])
+        # immediate debug ping to Telegram so you see webhook arrived (small summary)
+        try:
+            summary = None
+            # If it's the "model update" shape you posted:
+            if data.get("event") == "updated" and data.get("model"):
+                contact = data.get("data", {}).get("attributes", {})
+                phone = contact.get("phone")
+                name = (contact.get("firstname") or "") + " " + (contact.get("lastname") or "")
+                summary = f"Webhook: model update — {data.get('model')} — phone: {phone} name: {name}"
+            else:
+                # fallback: try WhatsApp style
+                entry = data.get("entry", [None])[0]
+                if entry:
+                    try:
+                        value = entry.get("changes", [])[0].get("value", {})
+                        msgs = value.get("messages", [])
+                        if msgs:
+                            m = msgs[0]
+                            phone = (value.get("contacts") or [{}])[0].get("wa_id") or m.get("from")
+                            body = m.get("text", {}).get("body") if m.get("type") == "text" else str(m.get("type"))
+                            summary = f"WhatsApp msg from {phone}: {body[:120]}"
+                    except Exception:
+                        summary = "Webhook: unknown entry shape"
+                else:
+                    summary = "Webhook: unknown shape"
+            if summary:
+                # send small debug to telegram
+                try:
+                    asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=summary))
+                except Exception as send_exc:
+                    print("Debug send to telegram failed:", send_exc)
+        except Exception as e_debug:
+            print("Debug summary error:", e_debug)
 
-        if not msgs:
-            return jsonify({"ok": True})
+        # --- Now try to handle WhatsApp-style payload if present ---
+        try:
+            entry = data.get("entry", [])[0]
+            value = entry.get("changes", [])[0].get("value", {})
+            msgs = value.get("messages", [])
+            contacts = value.get("contacts", [])
+        except Exception:
+            msgs = []
+            contacts = []
 
-        msg = msgs[0]
-        contact = contacts[0] if contacts else {}
-
-        wa_number = contact.get("wa_id") or msg.get("from")
-        name = contact.get("profile", {}).get("name", wa_number)
-
-        # Text message
-        if msg.get("type") == "text":
-            text = msg["text"]["body"]
-
-            message = f"📩 *WhatsApp message*\nFrom: {name} ({wa_number})\n\n{text}"
-
-            asyncio.run(bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=message,
-                parse_mode="Markdown"
-            ))
+        if msgs:
+            msg = msgs[0]
+            contact = contacts[0] if contacts else {}
+            wa_number = contact.get("wa_id") or msg.get("from")
+            name = contact.get("profile", {}).get("name", wa_number)
+            if msg.get("type") == "text":
+                text = msg["text"]["body"]
+                message = f"📩 *WhatsApp message*\nFrom: {name} ({wa_number})\n\n{text}"
+                try:
+                    asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown"))
+                except Exception as e_send:
+                    print("Send to TG error:", e_send)
+        else:
+            # If not WhatsApp shape, check the model-update shape you pasted and forward minimal info
+            try:
+                if data.get("event") == "updated" and data.get("model"):
+                    attrs = data.get("data", {}).get("attributes", {})
+                    phone = attrs.get("phone")
+                    firstname = attrs.get("firstname")
+                    lastname = attrs.get("lastname")
+                    text = f"Model update: {data.get('model')} id:{data.get('data',{}).get('id')}\nName: {firstname} {lastname}\nPhone: {phone}"
+                    try:
+                        asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text))
+                    except Exception as e_send2:
+                        print("Send to TG error (model):", e_send2)
+            except Exception as handle_exc:
+                print("Handle non-whatsapp shape error:", handle_exc)
 
     except Exception as e:
-        print("Webhook Error:", e)
+        print("Webhook Error (outer):", e)
 
     return jsonify({"ok": True})
-
 
 # ---------------------------------------------------------------------
 # TELEGRAM WEBHOOK HANDLER → REPLY TO WHATSAPP
