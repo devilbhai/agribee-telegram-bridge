@@ -4,10 +4,13 @@ version = "0.1.0"
 description = ""
 authors = ["Gunjan"]
 
+# Disable package mode so Poetry does not try to "install" your project
+package-mode = false
+
 [tool.poetry.dependencies]
 python = "^3.10"
 Flask = "2.3.2"
 python-telegram-bot = "20.7"
 requests = "2.31.0"
 
-[tool.poetry.dev-dependencies]
+[tool.poetry.group.dev.dependencies]
