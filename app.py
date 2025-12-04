@@ -1,18 +1,26 @@
 import os
 import threading
 import requests
+import asyncio
 from flask import Flask, request, jsonify
 from telegram import Bot
-from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    MessageHandler,
+    ContextTypes,
+    filters
+)
 
 app = Flask(__name__)
 
+# Environment variables
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 WHATSAPP_API_TOKEN = os.environ.get("WHATSAPP_API_TOKEN")
 
 bot = Bot(TELEGRAM_BOT_TOKEN)
 
+# WhatsApp API endpoints
 WHATSAPP_SEND_TEXT_URL  = "https://app.agribee.in/api/v1/agribee/messages/send"
 WHATSAPP_SEND_MEDIA_URL = "https://app.agribee.in/api/v1/agribee/messages/media"
 
@@ -22,6 +30,9 @@ def home():
     return "OK", 200
 
 
+# -------------------------
+# WHATSAPP → TELEGRAM
+# -------------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
@@ -40,9 +51,10 @@ def webhook():
         wa_number = contact.get("wa_id") or msg.get("from")
         name = contact.get("profile", {}).get("name", wa_number)
 
-        # TEXT MESSAGE
+        # Text message
         if msg.get("type") == "text":
             text = msg["text"]["body"]
+
             message = f"📩 *WhatsApp message*\nFrom: {name} ({wa_number})\n\n{text}"
 
             bot.send_message(
@@ -57,18 +69,17 @@ def webhook():
     return jsonify({"ok": True})
 
 
-# ------------------------
-# TELEGRAM BOT (Polling)
-# ------------------------
-
+# -------------------------
+# TELEGRAM → WHATSAPP
+# -------------------------
 async def reply_handler(update, context: ContextTypes.DEFAULT_TYPE):
 
     if not update.message.reply_to_message:
         return
 
     original_msg = update.message.reply_to_message.text
-    import re
 
+    import re
     match = re.search(r"\((\d{10,15})\)", original_msg)
     if not match:
         await update.message.reply_text("Could not extract WhatsApp number.")
@@ -76,46 +87,55 @@ async def reply_handler(update, context: ContextTypes.DEFAULT_TYPE):
 
     wa_number = match.group(1)
 
-    # TEXT
+    # TEXT SENDING
     if update.message.text:
         payload = {
             "to": wa_number,
             "message": update.message.text
         }
+
         headers = {
             "Authorization": f"Bearer {WHATSAPP_API_TOKEN}",
             "Content-Type": "application/json"
         }
 
         r = requests.post(WHATSAPP_SEND_TEXT_URL, json=payload, headers=headers)
+
         if r.ok:
             await update.message.reply_text("✅ Sent to WhatsApp")
         else:
             await update.message.reply_text("❌ Failed to send")
 
 
+# -------------------------
+# TELEGRAM BOT POLLING (fixed)
+# -------------------------
 def start_polling():
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    async def bot_main():
+        application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    application.add_handler(
-        MessageHandler(filters.TEXT & (~filters.COMMAND), reply_handler)
-    )
+        application.add_handler(
+            MessageHandler(filters.TEXT & (~filters.COMMAND), reply_handler)
+        )
 
-    print("Telegram polling started...")
-    application.run_polling()
+        print("Telegram polling started...")
+        await application.run_polling()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(bot_main())
 
 
-# ------------------------
-# RUN BOTH SYSTEMS
-# ------------------------
-
+# -------------------------
+# RUN BOTH
+# -------------------------
 if __name__ == "__main__":
-    # Telegram polling thread
+    # Start Telegram bot in background thread
     t = threading.Thread(target=start_polling)
     t.daemon = True
     t.start()
 
-    # Flask webhook
+    # Start Flask API
     port = int(os.environ.get("PORT", 5000))
     print("Flask server running...")
     app.run(host="0.0.0.0", port=port)
