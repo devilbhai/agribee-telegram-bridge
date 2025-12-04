@@ -1,59 +1,55 @@
 import os
-import io
 import threading
-import time
 import requests
 from flask import Flask, request, jsonify
-from telegram import Bot, Update, InputFile
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes, CallbackContext
+from telegram import Bot
+from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 
-# Flask Webhook App
 app = Flask(__name__)
 
-# ENV Variables
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 WHATSAPP_API_TOKEN = os.environ.get("WHATSAPP_API_TOKEN")
-
-# WhatsApp API Endpoints
-WHATSAPP_SEND_TEXT_URL = "https://app.agribee.in/api/v1/agribee/messages/send"
-WHATSAPP_SEND_MEDIA_URL = "https://app.agribee.in/api/v1/agribee/messages/media"
 
 bot = Bot(TELEGRAM_BOT_TOKEN)
 
+WHATSAPP_SEND_TEXT_URL  = "https://app.agribee.in/api/v1/agribee/messages/send"
+WHATSAPP_SEND_MEDIA_URL = "https://app.agribee.in/api/v1/agribee/messages/media"
 
-# -------------------------
-# WHATSAPP WEBHOOK HANDLER
-# -------------------------
 
 @app.route("/")
 def home():
-    return "OK"
+    return "OK", 200
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        payload = request.json
-        entry = payload["entry"][0]
-        change = entry["changes"][0]["value"]
-        message = change["messages"][0]
-        contact = change["contacts"][0]
+        data = request.json or {}
+        entry = data.get("entry", [])[0]
+        value = entry.get("changes", [])[0].get("value", {})
 
-        wa_number = contact["wa_id"]
-        name = contact["profile"]["name"]
+        msgs = value.get("messages", [])
+        contacts = value.get("contacts", [])
 
-        # Handle Text Message
-        if message["type"] == "text":
-            text = message["text"]["body"]
-            caption = f"📩 WhatsApp message\nFrom: {name} ({wa_number})\n\n{text}"
-
-            sent = bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=caption
-            )
+        if not msgs:
             return jsonify({"ok": True})
 
-        # Other message types can be added later
+        msg = msgs[0]
+        contact = contacts[0] if contacts else {}
+        wa_number = contact.get("wa_id") or msg.get("from")
+        name = contact.get("profile", {}).get("name", wa_number)
+
+        # TEXT MESSAGE
+        if msg.get("type") == "text":
+            text = msg["text"]["body"]
+            message = f"📩 *WhatsApp message*\nFrom: {name} ({wa_number})\n\n{text}"
+
+            bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=message,
+                parse_mode="Markdown"
+            )
 
     except Exception as e:
         print("Webhook Error:", e)
@@ -61,61 +57,65 @@ def webhook():
     return jsonify({"ok": True})
 
 
-# -------------------------
-# TELEGRAM REPLY HANDLER
-# -------------------------
+# ------------------------
+# TELEGRAM BOT (Polling)
+# ------------------------
 
-async def telegram_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def reply_handler(update, context: ContextTypes.DEFAULT_TYPE):
+
     if not update.message.reply_to_message:
         return
 
-    # extract WhatsApp number from Telegram forwarded message
-    text = update.message.reply_to_message.text
+    original_msg = update.message.reply_to_message.text
     import re
-    match = re.search(r"\((\d{10,15})\)", text)
+
+    match = re.search(r"\((\d{10,15})\)", original_msg)
     if not match:
-        await update.message.reply_text("Could not detect WhatsApp number.")
+        await update.message.reply_text("Could not extract WhatsApp number.")
         return
 
     wa_number = match.group(1)
 
-    # TEXT REPLY
+    # TEXT
     if update.message.text:
         payload = {
             "to": wa_number,
             "message": update.message.text
         }
-        headers = {"Authorization": f"Bearer {WHATSAPP_API_TOKEN}"}
+        headers = {
+            "Authorization": f"Bearer {WHATSAPP_API_TOKEN}",
+            "Content-Type": "application/json"
+        }
 
         r = requests.post(WHATSAPP_SEND_TEXT_URL, json=payload, headers=headers)
         if r.ok:
             await update.message.reply_text("✅ Sent to WhatsApp")
         else:
             await update.message.reply_text("❌ Failed to send")
-        return
 
 
-# -------------------------
-# RUN TELEGRAM POLLING IN THREAD
-# -------------------------
+def start_polling():
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-def start_telegram_bot():
-    print("Starting Telegram Polling...")
-    appTG = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    appTG.add_handler(MessageHandler(filters.ALL, telegram_reply))
-    appTG.run_polling()
+    application.add_handler(
+        MessageHandler(filters.TEXT & (~filters.COMMAND), reply_handler)
+    )
+
+    print("Telegram polling started...")
+    application.run_polling()
 
 
-# -------------------------
-# START BOTH SYSTEMS
-# -------------------------
+# ------------------------
+# RUN BOTH SYSTEMS
+# ------------------------
 
 if __name__ == "__main__":
-    # Start Telegram bot in separate thread
-    t = threading.Thread(target=start_telegram_bot)
+    # Telegram polling thread
+    t = threading.Thread(target=start_polling)
     t.daemon = True
     t.start()
 
-    # Start Flask for webhook
+    # Flask webhook
     port = int(os.environ.get("PORT", 5000))
+    print("Flask server running...")
     app.run(host="0.0.0.0", port=port)
