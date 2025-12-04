@@ -119,12 +119,14 @@ def start_polling():
         )
 
         print("Telegram polling started...")
-        await application.run_polling()
+        await application.run_polling(
+            stop_signals=None,   # IMPORTANT FIX
+            close_loop=False     # IMPORTANT FIX
+        )
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(bot_main())
-
 
 # -------------------------
 # RUN BOTH
